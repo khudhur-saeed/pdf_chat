@@ -18,7 +18,7 @@ app.add_middleware(
 
 
 # تحميل قاعدة البيانات
-vectordb = main.get_vectordb("arabic_stories", "story")
+vectordb = main.get_vectordb("name_of_your_persistent_directory", "name_of_your_collection")
 
 # نموذج البيانات الذي سيُرسل من المستخدم
 class ChatRequest(BaseModel):

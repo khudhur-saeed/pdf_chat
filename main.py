@@ -10,8 +10,7 @@ from unstructured.partition.pdf import partition_pdf # to read pdf files and con
 import dotenv , os # load environment variables from .env file 
 
 
-dotenv.load_dotenv() # load environment variables from .env file
-pdf_file = "/home/khedr/Documents/output.pdf"  
+dotenv.load_dotenv() # load environment variables from .env file  
 
 llm = GoogleGenerativeAI(
     model="gemini-2.0-flash",
@@ -293,10 +292,11 @@ def user_query(query: str,vectordb:Chroma):
             print(f"Fallback also failed: {fallback_error}")
             return "sorry, i cant help you right now, please try again later."
     
-    
-# convert the pdf file to a vector store
-# vectordb = pdf_to_vectordb(pdf_file,"arabic_stories","story",["arabic"])
-vectordb = get_vectordb("arabic_stories","story")
+
+
+pdf_path = "path/to/file.pdf"
+#convert the pdf file to a vector store
+vectordb = pdf_to_vectordb(pdf_path,"persist_directory","collection_name",["file language as list of strings"])
 
 def run_chatbot():
     while True:
