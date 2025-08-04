@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+langchain
+langchain_google_genai
+chromadb
+unstructured
+dotenv
+"unstructured[pdf]"
+tesseract-ocr-ara # this for the ocr in the unstructured library when im using the hi_res stratigy
