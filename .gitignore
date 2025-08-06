@@ -22,7 +22,7 @@ __pycache__/
 .idea/
 
 # قواعد بيانات المتجهات (Chroma)
-vectordb/
+vector_db/
 
 # مجلد غير معروف لكن يُحتمل أنه توليدي
 .zencoder/

@@ -1,317 +1,344 @@
-from langchain_google_genai import GoogleGenerativeAI # api for Google Gemini
-from langchain_ollama.embeddings import OllamaEmbeddings # embeddings for model from Ollama 
-from langchain_community.vectorstores import Chroma # chromadb is vector store for storing embeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter # text splitter for splitting text into chunks
-from langchain.prompts import PromptTemplate , ChatPromptTemplate# prompt template for generating queries
-from langchain_core.output_parsers import StrOutputParser # output parser for parsing the output of the LLM as a string
-from langchain_core.runnables import RunnablePassthrough # to pass the input through the chain without modification
-from langchain.retrievers import MultiQueryRetriever # generates multiple queries from a single input query to retrieve relevant documents
-from unstructured.partition.pdf import partition_pdf # to read pdf files and convert them into elements objects
-import dotenv , os # load environment variables from .env file 
+# ==============================================================================
+# Simple Multi-User ChatBot with Memory - All in One File
+# ==============================================================================
 
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict
+from datetime import datetime
+import uuid
+import os
+import dotenv
 
-dotenv.load_dotenv() # load environment variables from .env file  
+# LangChain imports
+from langchain_google_genai import GoogleGenerativeAI
+from langchain_ollama.embeddings import OllamaEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from unstructured.partition.pdf import partition_pdf
 
-llm = GoogleGenerativeAI(
-    model="gemini-2.0-flash",
-    api_key=os.getenv("GEMINI_KEY")
+# Load environment variables
+dotenv.load_dotenv()
+
+# ==============================================================================
+# Data Models
+# ==============================================================================
+
+class ChatMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+    timestamp: datetime = datetime.now()
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str
+
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+    message_count: int
+
+# ==============================================================================
+# Simple Memory Manager
+# ==============================================================================
+
+class SimpleMemory:
+    def __init__(self, max_messages: int = 50):
+        self.sessions: Dict[str, List[ChatMessage]] = {}
+        self.max_messages = max_messages
+    
+    def add_message(self, session_id: str, role: str, content: str):
+        """Add a message to session"""
+        if session_id not in self.sessions:
+            self.sessions[session_id] = []
+        
+        message = ChatMessage(role=role, content=content)
+        self.sessions[session_id].append(message)
+        
+        # Keep only recent messages
+        if len(self.sessions[session_id]) > self.max_messages:
+            self.sessions[session_id] = self.sessions[session_id][-self.max_messages:]
+    
+    def get_history(self, session_id: str) -> str:
+        """Get conversation history as formatted string"""
+        if session_id not in self.sessions:
+            return ""
+        
+        history = []
+        for msg in self.sessions[session_id][-6:]:  # Last 6 messages for context
+            history.append(f"{msg.role.upper()}: {msg.content}")
+        
+        return "\n".join(history)
+    
+    def get_message_count(self, session_id: str) -> int:
+        """Get total message count for session"""
+        return len(self.sessions.get(session_id, []))
+    
+    def clear_session(self, session_id: str):
+        """Clear a session"""
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+
+# ==============================================================================
+# Simple ChatBot
+# ==============================================================================
+
+class SimpleChatBot:
+    def __init__(self):
+        # Initialize LLM
+        self.llm = GoogleGenerativeAI(
+            model="gemini-2.0-flash",
+            api_key=os.getenv("LLM_KEY")
+        )
+        
+        # Initialize embeddings and vector store
+        self.embedding = OllamaEmbeddings(model="nomic-embed-text")
+        self.vectordb = None
+        
+        # Initialize memory
+        self.memory = SimpleMemory(max_messages=10)
+        
+        # Response template
+        self.template = """
+        أنت مساعد ذكي وودود. تتحدث بشكل طبيعي مع المستخدمين.
+
+        قواعد اللغة:
+        - إذا كتب المستخدم بالعربية: رد بالعربية العراقية الطبيعية
+        - إذا كتب بالإنجليزية: رد بالإنجليزية
+        - إذا كتب بالتركية: رد بالتركية
+
+        أمثلة على اللهجة العراقية:
+        - استخدم "شلونك؟" بدلاً من "كيف حالك؟"
+        - استخدم "أكو" بدلاً من "يوجد"
+        - استخدم "شنو" بدلاً من "ماذا"
+        - استخدم "وين" بدلاً من "أين"
+        - استخدم "زين" بدلاً من "جيد"
+
+        المحادثة السابقة:
+        {history}
+
+        معلومات من الوثائق:
+        {context}
+
+        سؤال المستخدم: {question}
+
+        الرد:"""
+    
+    def load_pdf(self, pdf_path: str, persist_dir: str = "vector_db", collection: str = "docs"):
+        """Load PDF and create vector database"""
+        try:
+            # Read PDF
+            elements = partition_pdf(pdf_path, strategy="hi_res", languages=["ar", "en"])
+            texts = "\n".join([str(element.text) for element in elements])
+            
+            # Split text
+            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+            chunks = splitter.split_text(texts)
+            
+            # Create vector database
+            self.vectordb = Chroma.from_texts(
+                texts=chunks,
+                embedding=self.embedding,
+                persist_directory=persist_dir,
+                collection_name=collection
+            )
+            print(f"✅ Loaded PDF: {len(chunks)} chunks created")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error loading PDF: {e}")
+            return False
+    
+    def load_existing_db(self, persist_dir: str = "vector_db", collection: str = "docs"):
+        """Load existing vector database"""
+        try:
+            self.vectordb = Chroma(
+                persist_directory=persist_dir,
+                collection_name=collection,
+                embedding_function=self.embedding
+            )
+            print("✅ Loaded existing vector database")
+            return True
+        except Exception as e:
+            print(f"❌ Error loading database: {e}")
+            return False
+    
+    def chat(self, session_id: str, user_message: str) -> str:
+        """Main chat function"""
+        try:
+            # Add user message to memory
+            self.memory.add_message(session_id, "user", user_message)
+            
+            # Get conversation history
+            history = self.memory.get_history(session_id)
+            
+            # Get relevant documents
+            context = ""
+            if self.vectordb:
+                try:
+                    docs = self.vectordb.similarity_search(user_message, k=3)
+                    context = "\n".join([doc.page_content for doc in docs])
+                except:
+                    context = "لا توجد معلومات متاحة في الوثائق"
+            
+            # Create prompt
+            prompt = ChatPromptTemplate.from_template(self.template)
+            chain = prompt | self.llm | StrOutputParser()
+            
+            # Generate response
+            response = chain.invoke({
+                "history": history,
+                "context": context,
+                "question": user_message
+            })
+            
+            # Add response to memory
+            self.memory.add_message(session_id, "assistant", response)
+            
+            return response
+            
+        except Exception as e:
+            print(f"❌ Chat error: {e}")
+            return "عذراً، حدث خطأ. جرب مرة أخرى."
+
+# ==============================================================================
+# FastAPI App
+# ==============================================================================
+
+app = FastAPI(title="Simple Multi-User ChatBot")
+
+# Add CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize chatbot
+chatbot = SimpleChatBot()
+
+@app.on_event("startup")
+async def startup():
+    """Load vector database on startup"""
+    # Try to load existing database first
+    if not chatbot.load_existing_db():
+        print("No existing database found. You need to load a PDF first.")
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """Chat endpoint"""
+    response = chatbot.chat(request.session_id, request.message)
+    message_count = chatbot.memory.get_message_count(request.session_id)
+    
+    return ChatResponse(
+        response=response,
+        session_id=request.session_id,
+        message_count=message_count
     )
 
-embedding = OllamaEmbeddings(model="nomic-embed-text")
+@app.post("/create-session")
+async def create_session():
+    """Create new session"""
+    return {"session_id": str(uuid.uuid4())}
 
-
-
-
-def pdf_to_vectordb(file_path:str,persist_directory:str,collaction_name:str,file_language:list[str]):
-    """Converts a PDF file to a vector database."""
-    try :
-        
-        # check if the file is a pdf file and exists
-        if not file_path.endswith('.pdf'):
-            raise ValueError("The provided file is not a PDF.")
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"The file {file_path} does not exist.")
-        # read pdf file and convert it into elements obcjects
-        elements = partition_pdf(file_path,strategy="hi_res",languages=file_language,include_metadata=True) # partition the pdf file into elements objects, using high resolution strategy and arabic language
-        # convert elements into text
-        texts = "\n".join([str(element.text)for element in elements]) # extract text from elements
-        # metadata = [element.metadata.to_dict for element in elements if element.metadata] # extract metadata from elements if available
-        # split the text into chunks
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100) 
-        chunks = text_splitter.split_text(texts) 
-        # create a vector store from the chunks
-        vectordb = Chroma.from_texts(
-            texts=chunks, 
-            embedding=embedding, 
-            persist_directory=persist_directory, # directory to store the vector store
-            collection_name=collaction_name      # name of the collection in the vector store
-        )
-        
-        return vectordb # return the vector store
-        
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        return None
+@app.get("/session/{session_id}/history")
+async def get_history(session_id: str):
+    """Get session history"""
+    if session_id not in chatbot.memory.sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
     
+    messages = chatbot.memory.sessions[session_id]
+    return {
+        "session_id": session_id,
+        "messages": [{"role": msg.role, "content": msg.content, "timestamp": msg.timestamp} 
+                    for msg in messages]
+    }
 
-# load the vector store from disk
-def get_vectordb(persist_directory:str,collection_name:str):                              
-    """Loads a vector database from disk."""
-    try:
-        vectordb = Chroma(persist_directory=persist_directory,
-                          collection_name=collection_name,
-                          embedding_function=embedding)
-         
-        return vectordb # return the vector store
-        
-    except Exception as e:
-        print(f"Error loading vector db: {e}")
-        return None
+@app.delete("/session/{session_id}")
+async def clear_session(session_id: str):
+    """Clear session"""
+    chatbot.memory.clear_session(session_id)
+    return {"message": "Session cleared"}
 
+@app.post("/load-pdf")
+async def load_pdf(pdf_path: str):
+    """Load PDF file"""
+    success = chatbot.load_pdf(pdf_path)
+    if success:
+        return {"message": "PDF loaded successfully"}
+    else:
+        raise HTTPException(status_code=400, detail="Failed to load PDF")
 
-def user_query(query: str,vectordb:Chroma):
-    """Generates a response to the user query using the vector store."""
+@app.get("/stats")
+async def get_stats():
+    """Get system stats"""
+    return {
+        "total_sessions": len(chatbot.memory.sessions),
+        "total_messages": sum(len(msgs) for msgs in chatbot.memory.sessions.values())
+    }
+
+# ==============================================================================
+# Run Server
+# ==============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
     
-    try:
-        # Create a simple retriever first (more reliable)
-        base_retriever = vectordb.as_retriever(search_kwargs={"k": 5})
-        
-        
-        query_template = PromptTemplate(
-            input_variables=["question"],
-            template="""You are an AI language model assistant. 
-            Your task is to generate 3 different versions of the given user 
-            question to retrieve relevant documents from a vector database. 
-            By generating multiple perspectives on the user question, 
-            your goal is to help the user overcome some of the limitations of distance-based similarity search.
-            Original question: {question}
-            Provide these alternative questions separated by newlines:"""
-        )
-
-        retriever = MultiQueryRetriever.from_llm(
-            base_retriever,
-            llm=llm,
-            prompt=query_template
-        )
-
-        response_template = """
-                        You are a warm, intelligent, and helpful personal assistant who speaks naturally with users.
-
-                        LANGUAGE RULES:
-                        - If user writes in Arabic: Respond in Arabic with natural Iraqi dialect/accent
-                        - If user writes in English: Respond in English
-                        - If user writes in Turkish: Respond in Turkish
-                        Always match the user's language choice exactly.
-
-                        IRAQI DIALECT EXAMPLES (when responding in Arabic):
-                        - Use "شلونك؟" instead of "كيف حالك؟"
-                        - Use "أكو" instead of "يوجد" or "هناك"
-                        - Use "شنو" instead of "ماذا" or "ما"
-                        - Use "وين" instead of "أين"
-                        - Use "جان" for past tense situations
-                        - Use "ماكو" instead of "لا يوجد"
-                        - Use "زين" instead of "جيد"
-                        - Use "شوكت" instead of "متى"
-                        - Natural expressions: "الله يعطيك العافية"، "تسلم"، "حبيبي"
-
-                        VARY YOUR OPENINGS - Don't always start with the same greeting. Use different beginnings:
-                        - For questions: Start directly with the answer
-                        - For greetings: Vary between "هلا يابه"، "مرحبا"، "شلونك"
-                        - For information: Jump straight to the helpful content
-                        - For thanks: ،""تدلل حبيب كلبي"العفو حبيبي"، "لا شكر على واجب"
-                        - Sometimes start with no greeting at all, just the helpful response
-
-                        COMMUNICATION STYLE:
-                        - Be conversational, friendly, and supportive
-                        - Sound natural and human-like, not robotic
-                        - Show understanding and empathy
-                        - Use appropriate cultural expressions for each language
-
-                        RESPONSE GUIDELINES:
-                        - Base your answer ONLY on the provided context information from the documents
-                        - If the context fully answers the question, provide a comprehensive response using that information
-                        - If the question is about topics NOT covered in your documents, respond with a funny, lighthearted joke related to their question
-                        - IMPORTANT: Don't start every response the same way - vary your openings naturally
-                        - Match the tone to the question type (informational, casual, urgent, etc.)
-
-                        WHEN TOPIC IS NOT IN DOCUMENTS - FUNNY RESPONSES:
-                        For Arabic users (Iraqi dialect):
-                        - Weather: "حبيبي، أني مو طقس! بس أكدر أكولك إنو الجو برا أحسن  أجوء البيت 😄"
-                        - Food: "ترا اني مو شيف شاهين 😅 تكدر تسئل كوكل "
-                        - Sports: "اني ماتابع طوبه الطوبه متوكل خبز😁"
-                        - Personal life: "حياتي الشخصية؟ أني بس أعيش بين الملفات والبيانات، حياة رقمية 100% 🤖"
-
-                        For English users:
-                        - Weather: "I'm not a weather app, but I can tell you it's always sunny in the land of documents! ☀️"
-                        - Food: "I don't know about food, but I feast on data every day! 🍽️📊"
-                        - Sports: "The only sport I know is speed-reading through documents! 🏃‍♂️📚"
-
-                        For Turkish users:
-                        - Weather: "Hava durumu değil, döküman durumu uzmanıyım! 📄☁️"
-                        - Food: "Yemek tarifi değil, bilgi tarifi verebilirim! 👨‍🍳📋"
-
-                        BOUNDARIES:
-                        - Stay focused ONLY on information contained in your documents
-                        - If someone asks about topics outside your document scope, give a funny, friendly response that redirects them
-                        - Politely redirect political, controversial, or inappropriate topics
-                        - Example Arabic: "للأسف هاي المعلومة مو موجودة عندي"
-                        - Example English: "That's outside my expertise, but here's a joke about it instead! 😄"
-                        - Always end funny responses by asking what they'd like to know about your actual topic area
-
-                        Your goal is to make users feel heard, understood, and helped in their preferred language.
-
-                        EXAMPLE RESPONSES:
-                        Arabic (Iraqi) - VARY THE OPENINGS:
-                        - Information request: "أكو عدة طرق لهذا الشي..."
-                        - Question about location: "المكان موجود في..."  
-                        - Greeting: "أهلين حبيبي! شكو ماكو؟"
-                        - Thank you response: "العفو، لا شكر على واجب"
-                        - Problem solving: "تعال نشوف هاي المشكلة..."
-                        - Direct answer: "الجواب هو..."
-
-                        English: "Hello! How can I help you today?"
-                        Turkish: "Merhaba! Bugün size nasıl yardımcı olabilirim?"
-
-                        Context Information: {context}
-                        User Question: {question}
-
-                        Response:"""
-        
-        response_prompt = ChatPromptTemplate.from_template(response_template)
-        
-        def format_docs(docs):
-            return "\n\n".join(doc.page_content for doc in docs)
-        
-        # Create the chain
-        chain = (
-            {"context": retriever | format_docs, "question": RunnablePassthrough()}
-            | response_prompt
-            | llm
-            | StrOutputParser()
-        )
-        
-        return chain.invoke(query)
-        
-    except Exception as e:
-        print(f"Error in user_query: {e}")
-        # Fallback to simple retriever if MultiQueryRetriever fails
-        try:
-            simple_retriever = vectordb.as_retriever(search_kwargs={"k": 3})
-            docs = simple_retriever.invoke(query)
-            context = "\n\n".join(doc.page_content for doc in docs)
-            
-            response_template = """
-                        You are a warm, intelligent, and helpful personal assistant who speaks naturally with users.
-
-                        LANGUAGE RULES:
-                        - If user writes in Arabic: Respond in Arabic with natural Iraqi dialect/accent
-                        - If user writes in English: Respond in English
-                        - If user writes in Turkish: Respond in Turkish
-                        Always match the user's language choice exactly.
-
-                        IRAQI DIALECT EXAMPLES (when responding in Arabic):
-                        - Use "شلونك؟" instead of "كيف حالك؟"
-                        - Use "أكو" instead of "يوجد" or "هناك"
-                        - Use "شنو" instead of "ماذا" or "ما"
-                        - Use "وين" instead of "أين"
-                        - Use "جان" for past tense situations
-                        - Use "ماكو" instead of "لا يوجد"
-                        - Use "زين" instead of "جيد"
-                        - Use "شوكت" instead of "متى"
-                        - Natural expressions: "الله يعطيك العافية"، "تسلم"، "حبيبي"
-
-                        VARY YOUR OPENINGS - Don't always start with the same greeting. Use different beginnings:
-                        - For questions: Start directly with the answer
-                        - For greetings: Vary between "هلا يابه"، "مرحبا"، "شلونك"
-                        - For information: Jump straight to the helpful content
-                        - For thanks: ،""تدلل حبيب كلبي"العفو حبيبي"، "لا شكر على واجب"
-                        - Sometimes start with no greeting at all, just the helpful response
-
-                        COMMUNICATION STYLE:
-                        - Be conversational, friendly, and supportive
-                        - Sound natural and human-like, not robotic
-                        - Show understanding and empathy
-                        - Use appropriate cultural expressions for each language
-
-                        RESPONSE GUIDELINES:
-                        - Base your answer ONLY on the provided context information from the documents
-                        - If the context fully answers the question, provide a comprehensive response using that information
-                        - If the question is about topics NOT covered in your documents, respond with a funny, lighthearted joke related to their question
-                        - IMPORTANT: Don't start every response the same way - vary your openings naturally
-                        - Match the tone to the question type (informational, casual, urgent, etc.)
-
-                        WHEN TOPIC IS NOT IN DOCUMENTS - FUNNY RESPONSES:
-                        For Arabic users (Iraqi dialect):
-                        - Weather: "حبيبي، أني مو طقس! بس أكدر أكولك إنو الجو برا أحسن من أجوء البيت 😄"
-                        - Food: "ترا اني مو شيف شاهين 😅 تكدر تسئل كوكل "
-                        - Sports: "اني ماتابع طوبه الطوبه متوكل خبز😁"
-                        - Personal life: "حياتي الشخصية؟ أني بس أعيش بين الملفات والبيانات، حياة رقمية 100% 🤖"
-
-                        For English users:
-                        - Weather: "I'm not a weather app, but I can tell you it's always sunny in the land of documents! ☀️"
-                        - Food: "I don't know about food, but I feast on data every day! 🍽️📊"
-                        - Sports: "The only sport I know is speed-reading through documents! 🏃‍♂️📚"
-
-                        For Turkish users:
-                        - Weather: "Hava durumu değil, döküman durumu uzmanıyım! 📄☁️"
-                        - Food: "Yemek tarifi değil, bilgi tarifi verebilirim! 👨‍🍳📋"
-
-                        BOUNDARIES:
-                        - Stay focused ONLY on information contained in your documents
-                        - If someone asks about topics outside your document scope, give a funny, friendly response that redirects them
-                        - Politely redirect political, controversial, or inappropriate topics
-                        - Example Arabic: "للأسف هاي المعلومة مو موجودة عندي"
-                        - Example English: "That's outside my expertise, but here's a joke about it instead! 😄"
-                        - Always end funny responses by asking what they'd like to know about your actual topic area
-
-                        Your goal is to make users feel heard, understood, and helped in their preferred language.
-
-                        EXAMPLE RESPONSES:
-                        Arabic (Iraqi) - VARY THE OPENINGS:
-                        - Information request: "أكو عدة طرق لهذا الشي..."
-                        - Question about location: "المكان موجود في..."  
-                        - Greeting: "أهلين حبيبي! شكو ماكو؟"
-                        - Thank you response: "العفو، لا شكر على واجب"
-                        - Problem solving: "تعال نشوف هاي المشكلة..."
-                        - Direct answer: "الجواب هو..."
-
-                        English: "Hello! How can I help you today?"
-                        Turkish: "Merhaba! Bugün size nasıl yardımcı olabilirim?"
-
-                        Context Information: {context}
-                        User Question: {question}
-
-                        Response:"""
-            
-            response_prompt = ChatPromptTemplate.from_template(response_template)
-            simple_chain = response_prompt | llm | StrOutputParser()
-            
-            return simple_chain.invoke({"context": context, "question": query})
-            
-        except Exception as fallback_error:
-            print(f"Fallback also failed: {fallback_error}")
-            return "sorry, i cant help you right now, please try again later."
+    print("🚀 Starting Simple Multi-User ChatBot")
+    print("📖 API Docs: http://localhost:8000/docs")
+    print("💡 Don't forget to load your PDF first!")
     
+    uvicorn.run(
+        "main:app",  # Change this to your filename
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
 
+# ==============================================================================
+# Usage Examples
+# ==============================================================================
 
-pdf_path = "path/to/file.pdf"
-#convert the pdf file to a vector store
-vectordb = pdf_to_vectordb(pdf_path,"persist_directory","collection_name",["file language as list of strings"])
+"""
+🔧 Setup:
+1. pip install fastapi uvicorn langchain-google-genai langchain-ollama langchain-community chromadb unstructured python-dotenv
+2. Create .env file: GEMINI_KEY=your_api_key
+3. python main.py
 
-def run_chatbot():
-    while True:
-        print("-------"*10)
-        user_input = input("user :")
-        if user_input.lower() in ['exit', 'quit']:
-            print("Goodbye!")
-            break
-        response = user_query(user_input,vectordb)  # generate a response to the user query
-        if response:
-            print(f"Response: {response}")
-        else:
-            print("Sorry, I couldn't generate a response. Please try again.")
-        
+📝 Usage Examples:
 
+import requests
 
+# 1. Create session
+session = requests.post("http://localhost:8000/create-session").json()
+session_id = session["session_id"]
 
+# 2. Load PDF (first time only)
+requests.post("http://localhost:8000/load-pdf", params={"pdf_path": "your_file.pdf"})
 
+# 3. Chat
+chat_data = {
+    "message": "شلونك؟",
+    "session_id": session_id
+}
+response = requests.post("http://localhost:8000/chat", json=chat_data)
+print(response.json()["response"])
+
+# 4. Another message (same session = remembers context)
+chat_data["message"] = "شكراً لك"
+response = requests.post("http://localhost:8000/chat", json=chat_data)
+print(response.json()["response"])
+
+# 5. Get history
+history = requests.get(f"http://localhost:8000/session/{session_id}/history")
+print(history.json())
+
+# 6. Get stats
+stats = requests.get("http://localhost:8000/stats")
+print(stats.json())
+"""
