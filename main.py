@@ -68,7 +68,7 @@ class SimpleMemory:
             return ""
         
         history = []
-        for msg in self.sessions[session_id][-6:]:  # Last 6 messages for context
+        for msg in self.sessions[session_id][-10:]:  # Last 6 messages for context
             history.append(f"{msg.role.upper()}: {msg.content}")
         
         return "\n".join(history)
