@@ -1,9 +1,0 @@
-fastapi
-uvicorn
-langchain
-langchain_google_genai
-chromadb
-unstructured
-dotenv
-"unstructured[pdf]"
-tesseract-ocr-ara 

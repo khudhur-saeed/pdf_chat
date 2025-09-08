@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+langchain
+langchain-google-genai
+langchain-ollama
+langchain-community
+chromadb
+unstructured[pdf]
+python-dotenv
+requests
