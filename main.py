@@ -12,7 +12,7 @@ import os
 import dotenv
 
 # LangChain imports
-from langchain_google_genai import GoogleGenerativeAI
+from langchain_google_genai import GoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_ollama.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -88,14 +88,30 @@ class SimpleMemory:
 
 class SimpleChatBot:
     def __init__(self):
+        # Resolve API key (support multiple env names)
+        api_key = os.getenv("LLM_KEY") or os.getenv("GEMINI_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError("Missing LLM_KEY/GEMINI_KEY/GOOGLE_API_KEY in environment or .env")
+
         # Initialize LLM
         self.llm = GoogleGenerativeAI(
             model="gemini-2.0-flash",
-            api_key=os.getenv("LLM_KEY")
+            api_key=api_key
         )
-        
-        # Initialize embeddings and vector store
-        self.embedding = OllamaEmbeddings(model="nomic-embed-text")
+
+        # Initialize embeddings and vector store (prefer Ollama, fallback to Google)
+        try:
+            self.embedding = OllamaEmbeddings(model="nomic-embed-text")
+            # Quick probe to ensure Ollama is reachable
+            _ = self.embedding.embed_query("ping")
+            print("✅ Using Ollama embeddings (nomic-embed-text)")
+        except Exception as e:
+            print(f"⚠️ Ollama embeddings unavailable, falling back to Google: {e}")
+            self.embedding = GoogleGenerativeAIEmbeddings(
+                model="text-embedding-004",
+                google_api_key=api_key
+            )
+            print("✅ Using Google Generative AI embeddings (text-embedding-004)")
         self.vectordb = None
         
         # Initialize memory
@@ -130,8 +146,15 @@ class SimpleChatBot:
     def load_pdf(self, pdf_path: str, persist_dir: str = "vector_db", collection: str = "docs"):
         """Load PDF and create vector database"""
         try:
-            # Read PDF
-            elements = partition_pdf(pdf_path, strategy="hi_res", languages=["ar", "en"])
+            # Validate path
+            if not os.path.isfile(pdf_path):
+                print(f"❌ Error loading PDF: file not found -> {pdf_path}")
+                return False
+
+            # Read PDF with a lightweight strategy to avoid system deps (tesseract/poppler)
+            # For higher quality OCR on scanned PDFs, switch to strategy="hi_res" but you'll need:
+            #   sudo apt-get install -y tesseract-ocr poppler-utils
+            elements = partition_pdf(pdf_path, strategy="fast", languages=["ar", "en"])
             texts = "\n".join([str(element.text) for element in elements])
             
             # Split text
