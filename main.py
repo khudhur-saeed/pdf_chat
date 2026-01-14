@@ -2,8 +2,9 @@
 # Simple Multi-User ChatBot with Memory - All in One File
 # ==============================================================================
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Dict
 from datetime import datetime
@@ -16,7 +17,7 @@ from langchain_google_genai import GoogleGenerativeAI, GoogleGenerativeAIEmbeddi
 from langchain_ollama.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from unstructured.partition.pdf import partition_pdf
 
@@ -95,7 +96,7 @@ class SimpleChatBot:
 
         # Initialize LLM
         self.llm = GoogleGenerativeAI(
-            model="gemini-2.0-flash",
+            model="gemini-3-flash-preview",
             api_key=api_key
         )
 
@@ -178,20 +179,51 @@ class SimpleChatBot:
     def load_existing_db(self, persist_dir: str = "vector_db", collection: str = "docs"):
         """Load existing vector database"""
         try:
-            self.vectordb = Chroma(
+            # Check if persist directory exists and has content
+            if not os.path.exists(persist_dir):
+                print("📂 No existing vector database found")
+                return False
+            
+            db = Chroma(
                 persist_directory=persist_dir,
                 collection_name=collection,
                 embedding_function=self.embedding
             )
-            print("✅ Loaded existing vector database")
-            return True
+            
+            # Check if database actually has documents
+            try:
+                count = db._collection.count()
+                if count == 0:
+                    print("📂 Vector database exists but is empty")
+                    return False
+                self.vectordb = db
+                print(f"✅ Loaded existing vector database ({count} documents)")
+                return True
+            except:
+                print("📂 Vector database exists but is empty")
+                return False
+                
         except Exception as e:
             print(f"❌ Error loading database: {e}")
+            return False
+    
+    def has_pdf_loaded(self) -> bool:
+        """Check if a PDF has been loaded"""
+        if not self.vectordb:
+            return False
+        try:
+            count = self.vectordb._collection.count()
+            return count > 0
+        except:
             return False
     
     def chat(self, session_id: str, user_message: str) -> str:
         """Main chat function"""
         try:
+            # Check if PDF is loaded
+            if not self.has_pdf_loaded():
+                return "📄 No PDF document uploaded yet!\n\nPlease upload a PDF file first using the '📤 Upload PDF' button in the top right corner. Once uploaded, I'll be able to answer your questions about the document's content."
+            
             # Add user message to memory
             self.memory.add_message(session_id, "user", user_message)
             
@@ -200,12 +232,13 @@ class SimpleChatBot:
             
             # Get relevant documents
             context = ""
-            if self.vectordb:
-                try:
-                    docs = self.vectordb.similarity_search(user_message, k=3)
-                    context = "\n".join([doc.page_content for doc in docs])
-                except:
-                    context = "لا توجد معلومات متاحة في الوثائق"
+            try:
+                docs = self.vectordb.similarity_search(user_message, k=3)
+                context = "\n".join([doc.page_content for doc in docs])
+                if not context.strip():
+                    context = "No relevant information found in the document."
+            except:
+                context = "لا توجد معلومات متاحة في الوثائق"
             
             # Create prompt
             prompt = ChatPromptTemplate.from_template(self.template)
@@ -224,7 +257,10 @@ class SimpleChatBot:
             return response
             
         except Exception as e:
+            error_msg = str(e)
             print(f"❌ Chat error: {e}")
+            if "RESOURCE_EXHAUSTED" in error_msg or "429" in error_msg:
+                return "⚠️ API quota exceeded. Please wait a moment and try again, or use a different API key."
             return "عذراً، حدث خطأ. جرب مرة أخرى."
 
 # ==============================================================================
@@ -288,6 +324,31 @@ async def clear_session(session_id: str):
     chatbot.memory.clear_session(session_id)
     return {"message": "Session cleared"}
 
+@app.post("/upload-pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    """Upload and process PDF file"""
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+    
+    # Save the uploaded file
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, file.filename)
+    
+    try:
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        # Load the PDF into vector database
+        success = chatbot.load_pdf(file_path)
+        if success:
+            return {"message": "PDF uploaded and processed successfully", "filename": file.filename}
+        else:
+            raise HTTPException(status_code=400, detail="Failed to process PDF")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
 @app.post("/load-pdf")
 async def load_pdf(pdf_path: str):
     """Load PDF file"""
@@ -304,6 +365,95 @@ async def get_stats():
         "total_sessions": len(chatbot.memory.sessions),
         "total_messages": sum(len(msgs) for msgs in chatbot.memory.sessions.values())
     }
+
+@app.get("/pdf-status")
+async def get_pdf_status():
+    """Check if a PDF is loaded"""
+    return {
+        "pdf_loaded": chatbot.has_pdf_loaded()
+    }
+
+@app.post("/select-pdf/{filename}")
+async def select_pdf(filename: str):
+    """Select and load a specific PDF file"""
+    upload_dir = "uploads"
+    file_path = os.path.join(upload_dir, filename)
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    try:
+        success = chatbot.load_pdf(file_path)
+        if success:
+            return {"message": f"Successfully loaded '{filename}'", "filename": filename}
+        else:
+            raise HTTPException(status_code=400, detail=f"Failed to load PDF: {filename}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load PDF: {str(e)}")
+
+@app.get("/current-pdf")
+async def get_current_pdf():
+    """Get the currently loaded PDF filename"""
+    # This is a simple check - in a real app you'd track this better
+    upload_dir = "uploads"
+    if os.path.exists(upload_dir):
+        pdfs = [f for f in os.listdir(upload_dir) if f.endswith('.pdf')]
+        # Return the most recently modified PDF
+        if pdfs:
+            most_recent = max(
+                pdfs,
+                key=lambda f: os.path.getmtime(os.path.join(upload_dir, f))
+            )
+            return {"current_pdf": most_recent, "has_pdf": True}
+    
+    return {"current_pdf": None, "has_pdf": False}
+
+@app.get("/uploaded-files")
+async def list_uploaded_files():
+    """List all uploaded PDF files"""
+    upload_dir = "uploads"
+    if not os.path.exists(upload_dir):
+        return {"files": []}
+    
+    files = []
+    for filename in os.listdir(upload_dir):
+        if filename.endswith('.pdf'):
+            file_path = os.path.join(upload_dir, filename)
+            file_stat = os.stat(file_path)
+            files.append({
+                "filename": filename,
+                "size": file_stat.st_size,
+                "uploaded_at": file_stat.st_mtime
+            })
+    
+    # Sort by upload time (newest first)
+    files.sort(key=lambda x: x["uploaded_at"], reverse=True)
+    return {"files": files}
+
+@app.delete("/uploaded-files/{filename}")
+async def delete_uploaded_file(filename: str):
+    """Delete an uploaded PDF file"""
+    upload_dir = "uploads"
+    file_path = os.path.join(upload_dir, filename)
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    try:
+        os.remove(file_path)
+        
+        # Clear the vector database if no more PDFs
+        remaining_pdfs = [f for f in os.listdir(upload_dir) if f.endswith('.pdf')]
+        if not remaining_pdfs:
+            chatbot.vectordb = None
+            # Also clear the vector_db directory
+            import shutil
+            if os.path.exists("vector_db"):
+                shutil.rmtree("vector_db")
+        
+        return {"message": f"File '{filename}' deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}")
 
 # ==============================================================================
 # Run Server
