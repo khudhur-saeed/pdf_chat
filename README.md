@@ -246,6 +246,10 @@ Contributions are welcome! Please:
 4. Push to branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
+## Screenshots
+<img width="1920" height="1080" alt="Screenshot_20260114_152115" src="https://github.com/user-attachments/assets/ddf08e5c-50fe-484b-b6fb-c7a9bd65f50b" />
+
+
 ## 📝 License
 
 This project is licensed under the MIT License - see LICENSE file for details.
